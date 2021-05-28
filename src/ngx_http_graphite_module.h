@@ -9,6 +9,8 @@
 #include "ngx_http_graphite_allocator.h"
 #include "ngx_http_graphite_array.h"
 
+typedef struct ngx_http_graphite_rcu_s ngx_http_graphite_rcu_t;
+
 typedef struct ngx_http_graphite_storage_s {
     time_t start_time;
     time_t last_time;
@@ -23,7 +25,7 @@ typedef struct ngx_http_graphite_storage_s {
     ngx_http_graphite_array_t *statistics;
 
     ngx_http_graphite_array_t *params;
-    ngx_http_graphite_array_t *internals;
+    ngx_http_graphite_rcu_t *internals_rcu;
 
 } ngx_http_graphite_storage_t;
 
