@@ -619,6 +619,27 @@ ngx_http_graphite_rcu_jump_destroy(ngx_http_graphite_context_t *context, ngx_htt
     ngx_http_graphite_allocator_free(context->storage->allocator, jump);
 }
 
+static void
+ngx_http_graphite_rcu_jump_push(ngx_http_graphite_rcu_jump_t **plist, ngx_http_graphite_rcu_jump_t *jump)
+{
+    ngx_http_graphite_rcu_jump_t *list = *plist;
+
+    jump->next = list;
+    *plist = jump;
+}
+
+static ngx_http_graphite_rcu_jump_t *
+ngx_http_graphite_rcu_jump_pop(ngx_http_graphite_rcu_jump_t **plist)
+{
+    ngx_http_graphite_rcu_jump_t *list = *plist;
+
+    if (list != NULL) {
+        *plist = list->next;
+        list->next = NULL;
+    }
+    return list;
+}
+
 static ngx_atomic_t
 ngx_http_graphite_rcu_jump_ref(ngx_http_graphite_rcu_jump_t *jump)
 {
@@ -626,9 +647,35 @@ ngx_http_graphite_rcu_jump_ref(ngx_http_graphite_rcu_jump_t *jump)
 }
 
 static ngx_atomic_t
-ngx_http_graphite_rcu_jump_unref(ngx_http_graphite_rcu_jump_t *jump)
+ngx_http_graphite_rcu_jump_unref(ngx_http_graphite_context_t *context, ngx_http_graphite_rcu_t *rcu, ngx_http_graphite_rcu_jump_t *jump, bool locked)
 {
-    return ngx_atomic_fetch_add(&jump->refcnt, -1);
+    ngx_atomic_t old = ngx_atomic_fetch_add(&jump->refcnt, -1);
+
+    if (old != 1)
+        return old;
+
+    if (!locked && jump->internals == NULL) {
+        /* someone have just freed our jump for us */
+        return 1;
+    }
+
+    ngx_slab_pool_t *shpool = (ngx_slab_pool_t*)context->gmcf->shared->shm.addr;
+    if (!locked) {
+        ngx_shmtx_lock(&shpool->mutex);
+
+        if (rcu->cur == jump || jump->internals == NULL) {
+            /* our jump has became an actual, or someone have just freed it for us */
+            ngx_shmtx_unlock(&shpool->mutex);
+            return 1;
+        }
+    }
+    ngx_http_graphite_rcu_jump_deinit(context, jump);
+    ngx_http_graphite_rcu_jump_push(&rcu->free, jump);
+
+    if (!locked)
+        ngx_shmtx_unlock(&shpool->mutex);
+
+    return 1;
 }
 
 static ngx_int_t
@@ -652,7 +699,7 @@ ngx_http_graphite_rcu_jump_init(ngx_http_graphite_context_t *context, ngx_http_g
 }
 
 static ngx_http_graphite_rcu_jump_t *
-ngx_http_graphite_rcu_read(ngx_http_graphite_rcu_t *rcu)
+ngx_http_graphite_rcu_read(ngx_http_graphite_context_t *context, ngx_http_graphite_rcu_t *rcu)
 {
     ngx_http_graphite_rcu_jump_t *jump;
 
@@ -663,7 +710,7 @@ ngx_http_graphite_rcu_read(ngx_http_graphite_rcu_t *rcu)
         ngx_memory_barrier();
         if (rcu->cur == jump)
             break;
-        ngx_http_graphite_rcu_jump_unref(jump);
+        ngx_http_graphite_rcu_jump_unref(context, rcu, jump, false);
     }
     return jump;
 }
@@ -1022,7 +1069,7 @@ ngx_http_graphite_context_from_request(ngx_http_request_t *r) {
     ngx_http_graphite_context_t context;
     context.phase = PHASE_REQUEST;
     context.storage = storage;
-    context.pool = NULL;
+    context.pool = r->pool;
     context.log = r->connection->log;
     context.gmcf = gmcf;
     return context;
@@ -2887,21 +2934,123 @@ ngx_http_graphite_by_link2(ngx_http_request_t *r, ngx_http_graphite_main_conf_t 
     return NGX_OK;
 }
 
+static ngx_array_t *
+ngx_http_graphite_create_param_args(ngx_pool_t *pool, const ngx_str_t *name, const ngx_str_t *config) {
+
+    ngx_array_t *args = ngx_array_create(pool, 4, sizeof(ngx_str_t));
+    if (args == NULL)
+        return NULL;
+
+    ngx_array_push(args);
+
+    ngx_str_t *n = ngx_array_push(args);
+    if (n == NULL) {
+        ngx_array_destroy(args);
+        return NULL;
+    }
+
+    n->data = ngx_palloc(pool, sizeof("name=") - 1 + name->len);
+    if (n->data == NULL) {
+        ngx_array_destroy(args);
+        return NULL;
+    }
+
+    n->len = ngx_sprintf(n->data, "name=%V", name) - n->data;
+
+    const u_char *p = config->data;
+    const u_char *config_end = p + config->len;
+    while (p < config_end) {
+        while (isspace(*p))
+            p++;
+        const u_char *begin = p;
+        while (*p && !isspace(*p))
+            p++;
+        const u_char *end = p;
+
+        if (end - begin != 0) {
+            ngx_str_t *arg = ngx_array_push(args);
+            if (arg == NULL) {
+                ngx_array_destroy(args);
+                return NULL;
+            }
+            arg->data = (u_char*)begin;
+            arg->len = end - begin;
+        }
+        else
+            break;
+    }
+
+    return args;
+}
+
 static const ngx_http_graphite_link_t *
-ngx_http_graphite_link2(ngx_http_graphite_context_t *context, const ngx_str_t *name) {
+ngx_http_graphite_link2(ngx_http_graphite_context_t *context, const ngx_str_t *name, const ngx_str_t *config) {
 
     ngx_slab_pool_t *shpool = (ngx_slab_pool_t*)context->gmcf->shared->shm.addr;
     ngx_http_graphite_storage_t *storage = (ngx_http_graphite_storage_t*)shpool->data;
 
-    ngx_http_graphite_rcu_jump_t *jump = ngx_http_graphite_rcu_read(storage->internals_rcu);
+    ngx_http_graphite_rcu_t *rcu = storage->internals_rcu;
+    ngx_http_graphite_rcu_jump_t *jump = ngx_http_graphite_rcu_read(context, rcu);
     const ngx_http_graphite_link_t *link = ngx_http_graphite_search_param_link(jump->internals, name);
-    ngx_http_graphite_rcu_jump_unref(jump);
+    ngx_http_graphite_rcu_jump_unref(context, rcu, jump, false);
 
-    return link;
+    if (link != NULL || config == NULL || config->len == 0)
+        return link;
+    if (storage->allocator->nomemory)
+        return NULL;
+
+    ngx_array_t *args = ngx_http_graphite_create_param_args(context->pool, name, config);
+    if (args == NULL)
+        return NULL;
+
+    /* will add a new internal */
+    ngx_shmtx_lock(&shpool->mutex);
+
+    jump = rcu->cur;
+    link = ngx_http_graphite_search_param_link(jump->internals, name);
+    if (link != NULL) {
+        /* another writer have added a new internal for us; we won't add it then */
+        ngx_shmtx_unlock(&shpool->mutex);
+        return link;
+    }
+
+    /* we'll do really add a new internal */
+
+    ngx_http_graphite_rcu_jump_t *new_jump = NULL;
+
+    ngx_http_graphite_param_t param;
+    if (ngx_http_graphite_parse_param_args(context, args, &param) != NGX_OK)
+        goto fail_locked;
+
+    if ((new_jump = ngx_http_graphite_rcu_jump_pop(&rcu->free)) == NULL
+        && (new_jump = ngx_http_graphite_rcu_jump_alloc(context)) == NULL)
+        goto fail_locked;
+
+    ngx_http_graphite_internal_t *internal;
+
+    if (ngx_http_graphite_rcu_jump_init(context, new_jump, jump) != NGX_OK
+        || (internal = ngx_http_graphite_add_internal(context, new_jump->internals, &param)) == NULL)
+        goto fail_locked;
+
+    rcu->cur = new_jump;
+    ngx_memory_barrier();
+
+    ngx_http_graphite_rcu_jump_unref(context, rcu, jump, true);
+    ngx_shmtx_unlock(&shpool->mutex);
+
+    return ngx_http_graphite_int2link(internal);
+
+fail_locked:
+    if (new_jump != NULL) {
+        ngx_http_graphite_rcu_jump_deinit(context, new_jump);
+        ngx_http_graphite_rcu_jump_push(&rcu->free, new_jump);
+    }
+    ngx_shmtx_unlock(&shpool->mutex);
+    return NULL;
 }
 
 ngx_int_t
-ngx_http_graphite(ngx_http_request_t *r, const ngx_str_t *name, double value) {
+ngx_http_graphite(ngx_http_request_t *r, const ngx_str_t *name, double value, const ngx_str_t *config) {
 
     ngx_http_graphite_context_t context = ngx_http_graphite_context_from_request(r);
     ngx_http_graphite_main_conf_t *gmcf = context.gmcf;
@@ -2909,7 +3058,7 @@ ngx_http_graphite(ngx_http_request_t *r, const ngx_str_t *name, double value) {
     if (!gmcf->enable)
         return NGX_OK;
 
-    const ngx_http_graphite_link_t *link = ngx_http_graphite_link2(&context, name);
+    const ngx_http_graphite_link_t *link = ngx_http_graphite_link2(&context, name, config);
     ngx_int_t rv = ngx_http_graphite_by_link2(r, gmcf, link, value);
 
     return rv;
@@ -2939,14 +3088,14 @@ ngx_http_graphite_shpool(ngx_http_request_t *r) {
 }
 
 const ngx_http_graphite_link_t *
-ngx_http_graphite_link(ngx_http_request_t *r, const ngx_str_t *name) {
+ngx_http_graphite_link(ngx_http_request_t *r, const ngx_str_t *name, const ngx_str_t *config) {
 
     ngx_http_graphite_context_t context = ngx_http_graphite_context_from_request(r);
 
     if (!context.gmcf->enable)
         return NULL;
 
-    return ngx_http_graphite_link2(&context, name);
+    return ngx_http_graphite_link2(&context, name, config);
 }
 
 static double
@@ -2982,7 +3131,7 @@ ngx_http_graphite_get(ngx_http_request_t *r, const ngx_str_t *name) {
         return 0;
 
     ngx_slab_pool_t *shpool = (ngx_slab_pool_t*)gmcf->shared->shm.addr;
-    const ngx_http_graphite_link_t *link = ngx_http_graphite_link2(&context, name);
+    const ngx_http_graphite_link_t *link = ngx_http_graphite_link2(&context, name, NULL);
     double rv = ngx_http_graphite_get_by_link2(shpool, link);
 
     return rv;
@@ -3041,7 +3190,7 @@ ngx_http_graphite_set(ngx_http_request_t *r, const ngx_str_t *name, double value
         return NGX_OK;
 
     ngx_slab_pool_t *shpool = (ngx_slab_pool_t*)gmcf->shared->shm.addr;
-    const ngx_http_graphite_link_t *link = ngx_http_graphite_link2(&context, name);
+    const ngx_http_graphite_link_t *link = ngx_http_graphite_link2(&context, name, NULL);
     ngx_int_t rv = ngx_http_graphite_set_by_link2(shpool, link, value);
 
     return rv;
