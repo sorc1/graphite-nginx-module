@@ -679,15 +679,15 @@ ngx_http_graphite_rcu_jump_unref(ngx_http_graphite_context_t *context, ngx_http_
 }
 
 static ngx_int_t
-ngx_http_graphite_rcu_jump_init(ngx_http_graphite_context_t *context, ngx_http_graphite_rcu_jump_t *jump, ngx_http_graphite_rcu_jump_t *old)
+ngx_http_graphite_rcu_jump_init(ngx_http_graphite_context_t *context, ngx_http_graphite_rcu_jump_t *jump, ngx_http_graphite_rcu_jump_t *old, ngx_uint_t extra_nalloc)
 {
     ngx_http_graphite_allocator_t *allocator = context->storage->allocator;
     ngx_http_graphite_array_t *internals;
 
     if (old == NULL)
-        internals = ngx_http_graphite_array_create(allocator, 1, sizeof(ngx_http_graphite_internal_t*));
+        internals = ngx_http_graphite_array_create(allocator, extra_nalloc ? extra_nalloc : 1, sizeof(ngx_http_graphite_internal_t*));
     else
-        internals = ngx_http_graphite_array_copy(allocator, old->internals);
+        internals = ngx_http_graphite_array_copy(allocator, old->internals, extra_nalloc, true);
 
     if (internals == NULL) {
         ngx_log_error(NGX_LOG_ERR, context->log, 0, "cannot allocate memory");
@@ -730,7 +730,7 @@ ngx_http_graphite_rcu_copy(ngx_http_graphite_context_t *context, ngx_http_graphi
         ngx_http_graphite_allocator_free(allocator, rcu);
         return NULL;
     }
-    if (ngx_http_graphite_rcu_jump_init(context, jump, old != NULL ? old->cur : NULL) != NGX_OK) {
+    if (ngx_http_graphite_rcu_jump_init(context, jump, old != NULL ? old->cur : NULL, 0) != NGX_OK) {
         ngx_http_graphite_rcu_jump_destroy(context, jump);
         ngx_http_graphite_allocator_free(allocator, rcu);
         return NULL;
@@ -2632,10 +2632,10 @@ ngx_http_graphite_shared_init(ngx_shm_zone_t *shm_zone, void *data)
 
     ngx_http_graphite_context_t context = ngx_http_graphite_context_from_shm_zone(shm_zone);
 
-    storage->metrics = ngx_http_graphite_array_copy(storage->allocator, gmcf->storage->metrics);
-    storage->gauges = ngx_http_graphite_array_copy(storage->allocator, gmcf->storage->gauges);
-    storage->statistics = ngx_http_graphite_array_copy(storage->allocator, gmcf->storage->statistics);
-    storage->params = ngx_http_graphite_array_copy(storage->allocator, gmcf->storage->params);
+    storage->metrics = ngx_http_graphite_array_copy(storage->allocator, gmcf->storage->metrics, 0, true);
+    storage->gauges = ngx_http_graphite_array_copy(storage->allocator, gmcf->storage->gauges, 0, true);
+    storage->statistics = ngx_http_graphite_array_copy(storage->allocator, gmcf->storage->statistics, 0, true);
+    storage->params = ngx_http_graphite_array_copy(storage->allocator, gmcf->storage->params, 0, true);
     storage->internals_rcu = ngx_http_graphite_rcu_copy(&context, gmcf->storage->internals_rcu);
 
     if (storage->metrics == NULL || storage->gauges == NULL || storage->statistics == NULL || storage->params == NULL || storage->internals_rcu == NULL) {
@@ -3028,7 +3028,7 @@ ngx_http_graphite_link2(ngx_http_graphite_context_t *context, const ngx_str_t *n
 
     ngx_http_graphite_internal_t *internal;
 
-    if (ngx_http_graphite_rcu_jump_init(context, new_jump, jump) != NGX_OK
+    if (ngx_http_graphite_rcu_jump_init(context, new_jump, jump, 1) != NGX_OK
         || (internal = ngx_http_graphite_add_internal(context, new_jump->internals, &param)) == NULL)
         goto fail_locked;
 

@@ -72,9 +72,22 @@ ngx_http_graphite_array_push_n(ngx_http_graphite_array_t *array, ngx_uint_t n) {
 }
 
 ngx_http_graphite_array_t *
-ngx_http_graphite_array_copy(ngx_http_graphite_allocator_t *allocator, ngx_http_graphite_array_t *array) {
+ngx_http_graphite_array_copy(ngx_http_graphite_allocator_t *allocator, ngx_http_graphite_array_t *array, ngx_uint_t extra_nalloc, ngx_int_t compact) {
 
-    ngx_http_graphite_array_t *copy = ngx_http_graphite_array_create(allocator, array->nalloc, array->size);
+    ngx_uint_t new_nalloc;
+
+    if (compact)
+        new_nalloc = array->nelts + extra_nalloc;
+    else {
+        ngx_uint_t new_nelts = array->nelts + extra_nalloc;
+
+        if (new_nelts <= array->nalloc)
+            new_nalloc = array->nalloc;
+        else
+            new_nalloc = 2 * ((extra_nalloc >= array->nalloc) ? extra_nalloc : array->nalloc);
+    }
+
+    ngx_http_graphite_array_t *copy = ngx_http_graphite_array_create(allocator, new_nalloc, array->size);
     if (copy == NULL)
         return NULL;
     if (ngx_http_graphite_array_push_n(copy, array->nelts) == NULL)

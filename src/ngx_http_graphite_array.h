@@ -21,6 +21,6 @@ ngx_int_t ngx_http_graphite_array_init(ngx_http_graphite_array_t *array, ngx_htt
 void ngx_http_graphite_array_destroy(ngx_http_graphite_array_t *array);
 void *ngx_http_graphite_array_push(ngx_http_graphite_array_t *a);
 void *ngx_http_graphite_array_push_n(ngx_http_graphite_array_t *a, ngx_uint_t n);
-ngx_http_graphite_array_t *ngx_http_graphite_array_copy(ngx_http_graphite_allocator_t *allocator, ngx_http_graphite_array_t *array);
+ngx_http_graphite_array_t *ngx_http_graphite_array_copy(ngx_http_graphite_allocator_t *allocator, ngx_http_graphite_array_t *array, ngx_uint_t extra_nalloc, ngx_int_t compact);
 
 #endif
